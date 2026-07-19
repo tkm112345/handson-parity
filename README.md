@@ -29,11 +29,14 @@ Go は「1 ディレクトリ ＝ 1 パッケージ、`func main()` は 1 つだ
 learn/parity/
 ├── part1-h20/   # 第1部 H20秋問6（1次元・検出）Module 0〜5 の最終コード
 │   └── main.go
-└── part2-r5/    # 第2部 R5秋問4（二次元・訂正）Module 6〜10 を写経（各モジュールで上書き）
-    └── main.go
+├── part2-r5/    # 第2部 R5秋問4（二次元・訂正）Module 6〜10 を写経（各モジュールで上書き）
+│   └── main.go
+└── part3-uart/  # 第3部 シリアル通信(UART)のパリティを擬似検証 Module 11〜16
+    ├── uart.go  # 共通部品（dataBits, parityBit, buildFrame, receive ...）を追記していく
+    └── main.go  # func main() だけ。Module ごとに書き換える
 ```
 
-実行は対象ディレクトリを指定する: `go run ./part1-h20` / `go run ./part2-r5`。
+実行は対象ディレクトリを指定する: `go run ./part1-h20` / `go run ./part2-r5` / `go run ./part3-uart`。
 （第1部の Module 0〜5 の解説は当時 `main.go` を書き換えながら進めた記録。現在は上記の構成に整理済み）
 
 パリティ方式は本ハンズオンでは **偶数パリティ**（1 の個数を偶数に揃える）で統一する。
@@ -840,6 +843,324 @@ func main() {
 - **4 ビットが長方形の 4 隅で誤る**と、行も列も偶奇が戻り **検出すらできない**。
   例: (1,2)(1,3)(2,2)(2,3) を反転して `checkRows`/`checkCols` が全 false になるのを確認する。
 - 右下の「全体のパリティ」`g[4][4]` だけで何が分かるか（＝第1部の 1 次元パリティ相当）を考える。
+
+---
+
+# 第3部: シリアル通信(UART)のパリティを擬似検証する（発展）
+
+第1部で見た「7bitコード＋パリティ1bit」は、実は **シリアル通信(UART)** で線の上を流れる
+フレームそのもの。ここでは Go でフレームを組み立て／分解し、パリティが誤りを検出する
+（そして訂正はできない）様子を、通信の文脈で再確認する。試験問題ではなく、第1部の
+実応用を体感する発展パート。
+
+UART フレームの構造（アイドルは 1、下位ビット LSB から送る）:
+
+```
+スタート   データ(7 or 8bit, LSB→)      パリティ  ストップ
+   0    | d0 d1 d2 d3 d4 d5 d6 (d7) |    p    |   1
+```
+
+設定は `8E1`（8bit データ / Even / stop1）のように書く。`N`＝パリティなし。
+第3部は **ファイル分割** で進める: 共通部品を `uart.go`、`func main()` を `main.go` に置き、
+`go run ./part3-uart` で実行する（Go は同じディレクトリの `.go` を 1 パッケージとしてまとめてビルドする）。
+
+---
+
+## Module 11: バイトをビット列に分解する（LSB first）
+
+**ゴール**: 1 バイトを n 個のデータビットに分解する。UART は **下位ビットから** 送るのが肝。
+
+`part3-uart/uart.go`:
+```go
+package main
+
+// dataBits は byte を n 個のデータビットに分解する（LSB=下位ビットから）
+func dataBits(b byte, n int) []int {
+	bits := make([]int, n)
+	for i := 0; i < n; i++ {
+		bits[i] = int((b >> i) & 1) // i 番目の下位ビットを取り出す
+	}
+	return bits
+}
+```
+
+`part3-uart/main.go`:
+```go
+package main
+
+import "fmt"
+
+func main() {
+	// 'A' = 0x41 = 0b0100_0001
+	fmt.Println("'A' の 8 データビット (LSB first):", dataBits('A', 8))
+}
+```
+
+実行:
+```bash
+go run ./part3-uart
+```
+
+**期待する出力**:
+```
+'A' の 8 データビット (LSB first): [1 0 0 0 0 0 1 0]
+```
+
+**ポイント**:
+- `'A'` は 0x41 =`0100 0001`。MSB から書くと `01000001` だが、UART は **bit0（LSB）から** 送るので `1 0 0 0 0 0 1 0` の順になる。
+- `(b >> i) & 1` … 第1部の「右シフトで最下位を見る」と同じ。i を 0→7 と動かし下位から取り出す。
+- `[]int`（スライス）は Python のリストに近い可変長の並び。`make([]int, n)` で長さ n を確保。
+
+---
+
+## Module 12: フレームを組み立てる（送信側）
+
+**ゴール**: データにパリティ・スタート・ストップを付けて 1 フレームにする。
+`8E1` なら 8bit データ＋1bit パリティで、線上は **9bit（＋start/stop で計 11bit）** になる。
+
+`uart.go` に **追記**（先頭に `import "fmt"` を足す。showFrame で使う）:
+```go
+import "fmt"
+
+// countOnes はビット列中の 1 の個数を返す
+func countOnes(bits []int) int {
+	c := 0
+	for _, b := range bits {
+		c += b
+	}
+	return c
+}
+
+// parityBit はデータから偶数(E)/奇数(O)パリティを計算する（N=なしは -1）
+func parityBit(data []int, mode string) int {
+	ones := countOnes(data)
+	switch mode {
+	case "E":
+		return ones % 2   // 偶数: 1 の数を偶数に揃える
+	case "O":
+		return 1 - ones%2 // 奇数: 1 の数を奇数に揃える
+	default:
+		return -1         // なし
+	}
+}
+
+// buildFrame は 1 バイトを UART フレーム(start+data+parity+stop)に組み立てる
+func buildFrame(b byte, n int, mode string) []int {
+	frame := []int{0}              // スタートビット
+	data := dataBits(b, n)
+	frame = append(frame, data...) // データ（LSB first）
+	if mode != "N" {
+		frame = append(frame, parityBit(data, mode)) // パリティ
+	}
+	frame = append(frame, 1)       // ストップビット
+	return frame
+}
+
+// showFrame はフレームをビット列として表示する
+func showFrame(frame []int) {
+	for i, b := range frame {
+		if i > 0 {
+			fmt.Print(" ")
+		}
+		fmt.Print(b)
+	}
+	fmt.Printf("   (%dbit)\n", len(frame))
+}
+```
+
+`main.go` を差し替え:
+```go
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Print("8E1  'A': ")
+	showFrame(buildFrame('A', 8, "E"))
+	fmt.Print("8O1  'A': ")
+	showFrame(buildFrame('A', 8, "O"))
+	fmt.Print("8N1  'A': ")
+	showFrame(buildFrame('A', 8, "N"))
+}
+```
+
+**期待する出力**:
+```
+8E1  'A': 0 1 0 0 0 0 0 1 0 0 1   (11bit)
+8O1  'A': 0 1 0 0 0 0 0 1 0 1 1   (11bit)
+8N1  'A': 0 1 0 0 0 0 0 1 0 1   (10bit)
+```
+
+**ポイント**:
+- 各行の左端が **スタート(0)**、右端が **ストップ(1)**。その間がデータ(LSB first)＋パリティ。
+- `'A'` はデータ中の 1 が 2 個（偶数）→ 偶数パリティ=0、奇数パリティ=1。8N1 はパリティ無しで 1bit 短い。
+- `8E1/8O1` は 11bit、`8N1` は 10bit。**8bit＋パリティ＝線上 9bit**（＋start/stop）が確かにできている。
+- `append(frame, data...)` の `...` は「スライスを展開して連結」。Go でリストをつなぐ書き方。
+
+---
+
+## Module 13: 受信側で分解・パリティ検査（誤りなし）
+
+**ゴール**: フレームからデータを取り出し、パリティを再計算して照合、バイトに復元する。
+
+`uart.go` に **追記**:
+```go
+// receive はフレームを分解し、復元バイトとパリティ検査結果(true=正常)を返す
+func receive(frame []int, n int, mode string) (byte, bool) {
+	data := frame[1 : 1+n] // スタートの次から n 個がデータ
+	ok := true
+	if mode != "N" {
+		p := frame[1+n]                 // 受信したパリティ
+		ok = parityBit(data, mode) == p // 再計算と一致するか
+	}
+	var b byte
+	for i := 0; i < n; i++ {
+		b |= byte(data[i]) << i // LSB first でバイトに戻す
+	}
+	return b, ok
+}
+```
+
+`main.go` を差し替え:
+```go
+package main
+
+import "fmt"
+
+func main() {
+	frame := buildFrame('A', 8, "E")
+	b, ok := receive(frame, 8, "E")
+	fmt.Print("受信フレーム: ")
+	showFrame(frame)
+	fmt.Printf("復元バイト = %q, パリティ検査 = %t\n", b, ok)
+}
+```
+
+**期待する出力**:
+```
+受信フレーム: 0 1 0 0 0 0 0 1 0 0 1   (11bit)
+復元バイト = 'A', パリティ検査 = true
+```
+
+**ポイント**:
+- `frame[1 : 1+n]` … スライスの一部を切り出す（Python の `frame[1:1+n]` と同じ）。スタートを飛ばして n 個。
+- 受信側はパリティを **自分で計算し直して** 届いた p と比べる。一致すれば正常とみなす。
+- `b |= byte(data[i]) << i` … LSB first のビットを元のバイトに戻す（第1部 `encode` の逆向き）。
+- `receive` が **2 つの値**（バイトと bool）を返すのは Go の多値返却。`b, ok := ...` で受ける。
+
+---
+
+## Module 14: 1 ビットの誤り → パリティエラーを検出
+
+**ゴール**: フレームの途中で 1 ビット化けさせると、受信側のパリティ検査が false になる。
+
+`main.go` を差し替え（`uart.go` はそのまま）:
+```go
+package main
+
+import "fmt"
+
+func main() {
+	frame := buildFrame('A', 8, "E")
+	frame[3] ^= 1 // 通信路で 1 ビット化けた（データの一部）
+
+	b, ok := receive(frame, 8, "E")
+	fmt.Print("化けたフレーム: ")
+	showFrame(frame)
+	fmt.Printf("復元バイト = %q, パリティ検査 = %t\n", b, ok)
+}
+```
+
+**期待する出力**:
+```
+化けたフレーム: 0 1 0 1 0 0 0 1 0 0 1   (11bit)
+復元バイト = 'E', パリティ検査 = false
+```
+
+**ポイント**:
+- 1 ビット反転 → データの 1 の個数の偶奇が変わる → 受信側の再計算パリティが届いた p と食い違う → **`false`＝検出成功**。
+- 復元は `'A'→'E'` と化けているが、`ok=false` なので「この文字は信用できない」と分かる。実機ではここで **再送要求** する。
+- ただし **どのビットが化けたかは分からない**（第1部と同じ）。検出止まりで訂正はできない。
+
+---
+
+## Module 15: 2 ビットの誤り → 見逃す（サイレント破損）
+
+**ゴール**: 2 ビット化けると偶奇が元に戻り、パリティ検査が true のまま通ってしまう。
+
+`main.go` を差し替え:
+```go
+package main
+
+import "fmt"
+
+func main() {
+	frame := buildFrame('A', 8, "E")
+	frame[3] ^= 1 // 1 つ目の誤り
+	frame[5] ^= 1 // 2 つ目の誤り
+
+	b, ok := receive(frame, 8, "E")
+	fmt.Print("化けたフレーム: ")
+	showFrame(frame)
+	fmt.Printf("復元バイト = %q, パリティ検査 = %t\n", b, ok)
+}
+```
+
+**期待する出力**:
+```
+化けたフレーム: 0 1 0 1 0 1 0 1 0 0 1   (11bit)
+復元バイト = 'U', パリティ検査 = true
+```
+
+**ポイント**:
+- 2 ビット反転 → 偶奇は元どおり → 受信側は **正常と誤判定（`true`）**。
+- しかし復元は `'A'→'U'` と **別の文字に化けている** のに気づけない＝**サイレント破損**。
+- これが第1部「偶数個の誤りは見逃す」の、通信での怖さ。パリティだけでは足りず、実務では CRC 等の強い検出符号を上位で併用する。
+
+---
+
+## Module 16: パリティなし(8N1) → そもそも検出しない（まとめ）
+
+**ゴール**: `N`（パリティなし）だと 1 ビット誤りすら検出できないことを確認し、パリティの意味を締める。
+
+`main.go` を差し替え:
+```go
+package main
+
+import "fmt"
+
+func main() {
+	frame := buildFrame('A', 8, "N") // パリティなし
+	frame[3] ^= 1                    // 1 ビット化けた
+
+	b, ok := receive(frame, 8, "N")
+	fmt.Print("化けたフレーム: ")
+	showFrame(frame)
+	fmt.Printf("復元バイト = %q, パリティ検査 = %t\n", b, ok)
+}
+```
+
+**期待する出力**:
+```
+化けたフレーム: 0 1 0 1 0 0 0 1 0 1   (10bit)
+復元バイト = 'E', パリティ検査 = true
+```
+
+**ポイント**:
+- パリティが無いので `receive` は常に `ok=true`。1 ビット化けても **検出できず素通り**。
+- パリティ 1bit を足すコスト（8N1=10bit → 8E1=11bit、約 1 割の速度低下）と引き換えに、1bit 誤りの検出能力を得ている、というトレードオフ。
+
+### まとめ: UART のパリティ（第1部の実応用）
+
+| 設定 | 線上のビット数 | 1bit 誤り | 2bit 誤り |
+| --- | --- | --- | --- |
+| 8N1 | 10bit | 検出できない | 検出できない |
+| 8E1 / 8O1 | 11bit | **検出できる**（位置不明・訂正不可） | 見逃す |
+
+- UART のパリティは第1部の 1 次元パリティそのもの。**1bit 誤りを検出して再送** が基本戦略。
+- 偶数/奇数は検出能力は同じ（奇数個検出・偶数個見逃し）。選択は互換性・慣習による。
+- 訂正まで欲しければ冗長を増やす（第2部の二次元パリティ／ハミング符号）。
+  これで「検出のみ(1次元) → 訂正可(二次元) → 実通信での使われ方(UART)」がひとつながりになる。
 
 ---
 
